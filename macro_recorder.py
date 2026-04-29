@@ -48,6 +48,9 @@ class MacroApp:
         self._stop_playback = threading.Event()
         self._independent_threads = []
 
+        self._held_keys = set()
+        self._held_keys_lock = threading.Lock()
+
         self._play_session_id = 0
 
         self._edit_entry = None
@@ -521,7 +524,8 @@ class MacroApp:
         for th in self._independent_threads:
             if th.is_alive():
                 return True
-        return False
+        with self._held_keys_lock:
+            return bool(self._held_keys)
 
     def toggle_playback(self):
         if self._is_playing():
@@ -548,11 +552,6 @@ class MacroApp:
                     raise ValueError
             except Exception:
                 messagebox.showerror("Invalid repeat delay", "Repeat delay must be >= 0 ms.")
-                return
-
-        for i, ev in enumerate(self.events, start=1):
-            if ev.get("mode") == "ind" and float(ev.get("delay", 0.0)) <= 0.0:
-                messagebox.showerror("Invalid IND delay", f"Step {i} is IND but has 0ms delay.")
                 return
 
         self._stop_playback.clear()
@@ -584,6 +583,41 @@ class MacroApp:
             except Exception:
                 pass
 
+    def _hold_key_game_safe(self, key: str):
+        with self._held_keys_lock:
+            if key in self._held_keys:
+                return
+            self._held_keys.add(key)
+
+        try:
+            input_driver.keyDown(key)
+        except Exception as ex:
+            self._log_error(f"HOLD_KEY key={key}", ex)
+
+
+    def _release_key_game_safe(self, key: str):
+        with self._held_keys_lock:
+            if key not in self._held_keys:
+                return
+            self._held_keys.remove(key)
+
+        try:
+            input_driver.keyUp(key)
+        except Exception as ex:
+            self._log_error(f"RELEASE_KEY key={key}", ex)
+
+
+    def _release_all_held_keys(self):
+        with self._held_keys_lock:
+            keys = list(self._held_keys)
+            self._held_keys.clear()
+
+        for key in keys:
+            try:
+                input_driver.keyUp(key)
+            except Exception as ex:
+                self._log_error(f"RELEASE_ALL key={key}", ex)
+
     def _play_worker_sequential_safe(self, session_id: int):
         try:
             self._play_worker_sequential(session_id)
@@ -593,6 +627,8 @@ class MacroApp:
                 0,
                 lambda: self._set_status("SEQ thread error (see macro_errors.log). IND may still run.")
             )
+        finally:
+            self._release_all_held_keys()
 
     def _play_worker_sequential(self, session_id: int):
         speed = max(0.01, float(self.playback_speed.get()))
@@ -607,13 +643,34 @@ class MacroApp:
             for step in seq_events:
                 if self._stop_playback.is_set() or session_id != self._play_session_id:
                     return
-                delay = float(step["delay"]) / speed
-                time.sleep(max(0.0, delay))
+
+                delay = float(step["delay"])
+
+                if delay <= 0.0:
+                    # 0ms SEQ means hold key until playback stops.
+                    self._hold_key_game_safe(step["key"])
+                    continue
+
+                time.sleep(max(0.0, delay / speed))
                 self._press_key_game_safe(step["key"])
 
             if self._stop_playback.is_set() or session_id != self._play_session_id:
                 return
+
             if not repeat:
+                # Keep macro alive if a 0ms SEQ key is being held.
+                while True:
+                    with self._held_keys_lock:
+                        has_held_keys = bool(self._held_keys)
+
+                    if not has_held_keys:
+                        break
+
+                    if self._stop_playback.is_set() or session_id != self._play_session_id:
+                        return
+
+                    time.sleep(0.02)
+
                 break
 
             if repeat_delay_s > 0:
@@ -634,9 +691,16 @@ class MacroApp:
     def _start_independent_workers(self, session_id: int):
         self._independent_threads = []
         ind_events = [ev for ev in self.events if ev.get("mode", "seq") == "ind"]
+
         for ev in ind_events:
             key = ev["key"]
             period_s = float(ev["delay"])
+
+            if period_s <= 0.0:
+                # 0ms IND means hold key until playback stops.
+                self._hold_key_game_safe(key)
+                continue
+
             th = threading.Thread(
                 target=self._independent_worker_safe,
                 args=(key, period_s, session_id),
@@ -685,7 +749,9 @@ class MacroApp:
 
     def stop_playback(self):
         self._stop_playback.set()
-        self._set_status("Stopping...")
+        self._play_session_id += 1
+        self._release_all_held_keys()
+        self._set_status("STANDBY")
 
     # ---------------- Hotkey capture ----------------
 
