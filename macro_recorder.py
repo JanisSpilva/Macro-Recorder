@@ -69,14 +69,11 @@ class MacroApp:
         self.events = self.macros[0]["events"]
         self._last_time = None
 
-        self._play_thread = None
-        self._stop_playback = threading.Event()
-        self._independent_threads = []
-
-        self._held_keys = set()
-        self._held_keys_lock = threading.Lock()
-
-        self._play_session_id = 0
+        # Each macro gets its own independent playback session so several
+        # macros can run simultaneously.
+        self._play_sessions = {}
+        self._play_sessions_lock = threading.Lock()
+        self._pressed_toggle_macros = set()
 
         self._edit_entry = None
         self._edit_iid = None
@@ -91,9 +88,6 @@ class MacroApp:
         self.repeat_enabled = tk.BooleanVar(value=False)
         self.hold_to_repeat = tk.BooleanVar(value=False)
         self.repeat_delay_ms = tk.IntVar(value=0)
-
-        # Index of the macro currently being held for hold-to-repeat playback.
-        self._held_toggle_macro_index = None
 
         self._capturing_toggle_key = False
 
@@ -546,52 +540,29 @@ class MacroApp:
             and bool(self.macros[macro_index].get("hold_to_repeat", False))
         )
 
+    def _macro_is_playing(self, macro_index: int) -> bool:
+        with self._play_sessions_lock:
+            session = self._play_sessions.get(macro_index)
+            return bool(session and not session["stop"].is_set())
+
     def start_held_macro(self, macro_index: int):
-        if not (0 <= macro_index < len(self.macros)):
+        if not (0 <= macro_index < len(self.macros)) or self.recording:
             return
-        if self.recording:
+        if self._macro_is_playing(macro_index):
             return
-
-        # Ignore key-repeat/autorepeat down events while the same toggle is held.
-        if self._held_toggle_macro_index == macro_index:
-            return
-
-        if self._is_playing():
-            self.stop_playback()
-
-        if macro_index != self.active_macro_index:
-            self._store_active_macro()
-            self.active_macro_index = macro_index
-            self._refresh_macro_selector()
-            self._load_active_macro()
-
-        self._held_toggle_macro_index = macro_index
-        self.play_macro()
+        self.play_macro_by_index(macro_index)
 
     def stop_held_macro(self, macro_index: int):
-        if self._held_toggle_macro_index != macro_index:
-            return
-        self._held_toggle_macro_index = None
-        self.stop_playback()
+        self.stop_macro(macro_index)
 
     def toggle_macro_by_index(self, macro_index: int):
-        if not (0 <= macro_index < len(self.macros)):
+        if not (0 <= macro_index < len(self.macros)) or self.recording:
             return
 
-        if self._is_playing():
-            self.stop_playback()
-            return
-
-        if self.recording:
-            return
-
-        if macro_index != self.active_macro_index:
-            self._store_active_macro()
-            self.active_macro_index = macro_index
-            self._refresh_macro_selector()
-            self._load_active_macro()
-
-        self.play_macro()
+        if self._macro_is_playing(macro_index):
+            self.stop_macro(macro_index)
+        else:
+            self.play_macro_by_index(macro_index)
 
     # ---------------- UI ----------------
 
@@ -887,26 +858,28 @@ class MacroApp:
 
             if macro_index is not None:
                 if self._macro_uses_hold_to_repeat(macro_index):
-                    if e.event_type == "down":
+                    if e.event_type == "down" and macro_index not in self._pressed_toggle_macros:
+                        self._pressed_toggle_macros.add(macro_index)
                         self.root.after(
                             0,
                             lambda index=macro_index: self.start_held_macro(index),
                         )
                     elif e.event_type == "up":
+                        self._pressed_toggle_macros.discard(macro_index)
                         self.root.after(
                             0,
                             lambda index=macro_index: self.stop_held_macro(index),
                         )
                     return
 
-                if e.event_type == "down" and not self._toggle_pressed_guard:
-                    self._toggle_pressed_guard = True
+                if e.event_type == "down" and macro_index not in self._pressed_toggle_macros:
+                    self._pressed_toggle_macros.add(macro_index)
                     self.root.after(
                         0,
                         lambda index=macro_index: self.toggle_macro_by_index(index),
                     )
                 elif e.event_type == "up":
-                    self._toggle_pressed_guard = False
+                    self._pressed_toggle_macros.discard(macro_index)
                 return
 
         if not self.recording or e.event_type != "down":
@@ -956,26 +929,28 @@ class MacroApp:
 
         if macro_index is not None:
             if self._macro_uses_hold_to_repeat(macro_index):
-                if pressed:
+                if pressed and macro_index not in self._pressed_toggle_macros:
+                    self._pressed_toggle_macros.add(macro_index)
                     self.root.after(
                         0,
                         lambda index=macro_index: self.start_held_macro(index),
                     )
-                else:
+                elif not pressed:
+                    self._pressed_toggle_macros.discard(macro_index)
                     self.root.after(
                         0,
                         lambda index=macro_index: self.stop_held_macro(index),
                     )
                 return
 
-            if pressed and not self._toggle_pressed_guard:
-                self._toggle_pressed_guard = True
+            if pressed and macro_index not in self._pressed_toggle_macros:
+                self._pressed_toggle_macros.add(macro_index)
                 self.root.after(
                     0,
                     lambda index=macro_index: self.toggle_macro_by_index(index),
                 )
             elif not pressed:
-                self._toggle_pressed_guard = False
+                self._pressed_toggle_macros.discard(macro_index)
             return
 
         # Ignore the Record/Stop button's own left-click.
@@ -1229,76 +1204,102 @@ class MacroApp:
     # ---------------- Playback ----------------
 
     def _is_playing(self) -> bool:
-        if self._play_thread and self._play_thread.is_alive():
-            return True
-        for th in self._independent_threads:
-            if th.is_alive():
-                return True
-        with self._held_keys_lock:
-            return bool(self._held_keys)
+        with self._play_sessions_lock:
+            return any(not session["stop"].is_set() for session in self._play_sessions.values())
 
     def toggle_playback(self):
-        if self._is_playing():
-            self.stop_playback()
-        else:
-            self.play_macro()
+        self.toggle_macro_by_index(self.active_macro_index)
 
     def play_macro(self):
         self._store_active_macro()
+        self.play_macro_by_index(self.active_macro_index)
+
+    def play_macro_by_index(self, macro_index: int):
         if self.recording:
             messagebox.showwarning("Recording", "Stop recording before playback.")
             return
-        if not self.events:
-            messagebox.showinfo("Empty", "No macro recorded.")
+        if not (0 <= macro_index < len(self.macros)):
             return
-        if self._is_playing():
+        if self._macro_is_playing(macro_index):
             return
 
-        self._end_inline_edit(commit=True)
+        macro = self.macros[macro_index]
+        events = [dict(ev) for ev in macro.get("events", [])]
+        if not events:
+            messagebox.showinfo("Empty", f"{macro['name']} has no recorded steps.")
+            return
 
-        if self.repeat_enabled.get():
-            try:
-                rd = int(self.repeat_delay_ms.get())
-                if rd < 0:
-                    raise ValueError
-            except Exception:
-                messagebox.showerror("Invalid repeat delay", "Repeat delay must be >= 0 ms.")
-                return
+        try:
+            repeat_delay_ms = max(0, int(macro.get("repeat_delay_ms", 0)))
+        except Exception:
+            messagebox.showerror("Invalid repeat delay", "Repeat delay must be >= 0 ms.")
+            return
 
-        self._stop_playback.clear()
-        self._play_session_id += 1
-        session_id = self._play_session_id
+        session = {
+            "stop": threading.Event(),
+            "threads": [],
+            "held_inputs": set(),
+            "held_lock": threading.Lock(),
+            "name": macro["name"],
+            "events": events,
+            "speed": max(0.01, float(macro.get("speed", 1.0))),
+            "repeat": bool(macro.get("repeat_enabled", False))
+                      or bool(macro.get("hold_to_repeat", False)),
+            "repeat_delay_s": self.ms_int_to_sec(repeat_delay_ms),
+        }
 
-        self._start_independent_workers(session_id=session_id)
+        with self._play_sessions_lock:
+            self._play_sessions[macro_index] = session
 
-        if any(ev.get("mode", "seq") == "seq" for ev in self.events):
-            self._play_thread = threading.Thread(
-                target=self._play_worker_sequential_safe,
-                args=(session_id,),
-                daemon=True
+        ind_events = [ev for ev in events if ev.get("mode", "seq") == "ind"]
+        for ev in ind_events:
+            if float(ev.get("delay", 0.0)) <= 0.0:
+                self._session_hold_input(session, ev["key"])
+            else:
+                th = threading.Thread(
+                    target=self._session_independent_worker_safe,
+                    args=(macro_index, session, ev["key"], float(ev["delay"])),
+                    daemon=True,
+                )
+                session["threads"].append(th)
+                th.start()
+
+        seq_events = [ev for ev in events if ev.get("mode", "seq") == "seq"]
+        if seq_events:
+            th = threading.Thread(
+                target=self._session_sequential_worker_safe,
+                args=(macro_index, session, seq_events),
+                daemon=True,
             )
-            self._play_thread.start()
+            session["threads"].append(th)
+            th.start()
 
-        if self.hold_to_repeat.get():
-            self._set_status("Playing while toggle is held...")
-        else:
-            self._set_status("Playing... (toggle key/button stops)")
-        self._schedule_watchdog(session_id)
+        self._set_status(
+            f"Started {macro['name']}. "
+            f"{self._running_macro_count()} macro(s) running."
+        )
+
+    def _running_macro_count(self) -> int:
+        with self._play_sessions_lock:
+            return sum(
+                1 for session in self._play_sessions.values()
+                if not session["stop"].is_set()
+            )
 
     def _press_key_game_safe(self, key: str):
-        HOLD_S = 0.02
+        hold_s = 0.02
 
         if self._is_mouse_input(key):
             button = self._pynput_mouse_button(key)
             if self._mouse_controller is None or button is None:
                 self._log_error(
                     f"MOUSE_CLICK input={key}",
-                    RuntimeError(f"Mouse button is unavailable: {key}")
+                    RuntimeError(f"Mouse button is unavailable: {key}"),
                 )
                 return
             try:
                 self._mouse_controller.press(button)
-                time.sleep(HOLD_S)
+                time.sleep(hold_s)
                 self._mouse_controller.release(button)
             except Exception as ex:
                 self._log_error(f"MOUSE_CLICK input={key}", ex)
@@ -1306,7 +1307,7 @@ class MacroApp:
 
         try:
             input_driver.keyDown(key)
-            time.sleep(HOLD_S)
+            time.sleep(hold_s)
             input_driver.keyUp(key)
         except Exception:
             try:
@@ -1314,11 +1315,11 @@ class MacroApp:
             except Exception as ex:
                 self._log_error(f"KEY_PRESS key={key}", ex)
 
-    def _hold_key_game_safe(self, key: str):
-        with self._held_keys_lock:
-            if key in self._held_keys:
+    def _session_hold_input(self, session, key: str):
+        with session["held_lock"]:
+            if key in session["held_inputs"]:
                 return
-            self._held_keys.add(key)
+            session["held_inputs"].add(key)
 
         try:
             if self._is_mouse_input(key):
@@ -1329,32 +1330,14 @@ class MacroApp:
             else:
                 input_driver.keyDown(key)
         except Exception as ex:
-            with self._held_keys_lock:
-                self._held_keys.discard(key)
+            with session["held_lock"]:
+                session["held_inputs"].discard(key)
             self._log_error(f"HOLD_INPUT input={key}", ex)
 
-    def _release_key_game_safe(self, key: str):
-        with self._held_keys_lock:
-            if key not in self._held_keys:
-                return
-            self._held_keys.remove(key)
-
-        try:
-            if self._is_mouse_input(key):
-                button = self._pynput_mouse_button(key)
-                if self._mouse_controller is None or button is None:
-                    raise RuntimeError(f"Mouse button is unavailable: {key}")
-                self._mouse_controller.release(button)
-            else:
-                input_driver.keyUp(key)
-        except Exception as ex:
-            self._log_error(f"RELEASE_INPUT input={key}", ex)
-
-
-    def _release_all_held_keys(self):
-        with self._held_keys_lock:
-            keys = list(self._held_keys)
-            self._held_keys.clear()
+    def _release_session_inputs(self, session):
+        with session["held_lock"]:
+            keys = list(session["held_inputs"])
+            session["held_inputs"].clear()
 
         for key in keys:
             try:
@@ -1366,142 +1349,111 @@ class MacroApp:
                 else:
                     input_driver.keyUp(key)
             except Exception as ex:
-                self._log_error(f"RELEASE_ALL input={key}", ex)
+                self._log_error(f"RELEASE_SESSION input={key}", ex)
 
-    def _play_worker_sequential_safe(self, session_id: int):
+    @staticmethod
+    def _session_wait(session, seconds: float) -> bool:
+        end_time = time.time() + max(0.0, seconds)
+        while time.time() < end_time:
+            if session["stop"].is_set():
+                return False
+            time.sleep(min(0.01, max(0.001, end_time - time.time())))
+        return not session["stop"].is_set()
+
+    def _session_sequential_worker_safe(self, macro_index, session, seq_events):
         try:
-            self._play_worker_sequential(session_id)
+            self._session_sequential_worker(session, seq_events)
         except Exception as ex:
-            self._log_error("SEQ_THREAD", ex)
-            self.root.after(
-                0,
-                lambda: self._set_status("SEQ thread error (see macro_errors.log). IND may still run.")
-            )
+            self._log_error(f"SEQ_THREAD macro={session['name']}", ex)
         finally:
-            self._release_all_held_keys()
+            self._session_thread_finished(macro_index, session)
 
-    def _play_worker_sequential(self, session_id: int):
-        speed = max(0.01, float(self.playback_speed.get()))
-        repeat = bool(self.repeat_enabled.get()) or bool(self.hold_to_repeat.get())
-        repeat_delay_s = self.ms_int_to_sec(int(self.repeat_delay_ms.get() or 0))
-
-        seq_events = [ev for ev in self.events if ev.get("mode", "seq") == "seq"]
-        if not seq_events:
-            return
-
-        while True:
+    def _session_sequential_worker(self, session, seq_events):
+        while not session["stop"].is_set():
             for step in seq_events:
-                if self._stop_playback.is_set() or session_id != self._play_session_id:
+                if session["stop"].is_set():
                     return
 
-                delay = float(step["delay"])
-
+                delay = float(step.get("delay", 0.0))
                 if delay <= 0.0:
-                    # 0ms SEQ means hold key until playback stops.
-                    self._hold_key_game_safe(step["key"])
+                    self._session_hold_input(session, step["key"])
                     continue
 
-                time.sleep(max(0.0, delay / speed))
+                if not self._session_wait(session, delay / session["speed"]):
+                    return
                 self._press_key_game_safe(step["key"])
 
-            if self._stop_playback.is_set() or session_id != self._play_session_id:
+            if not session["repeat"]:
                 return
 
-            if not repeat:
-                # Keep macro alive if a 0ms SEQ key is being held.
-                while True:
-                    with self._held_keys_lock:
-                        has_held_keys = bool(self._held_keys)
+            if session["repeat_delay_s"] > 0:
+                if not self._session_wait(session, session["repeat_delay_s"]):
+                    return
 
-                    if not has_held_keys:
-                        break
+    def _session_independent_worker_safe(self, macro_index, session, key, period_s):
+        try:
+            while not session["stop"].is_set():
+                if not self._session_wait(session, period_s / session["speed"]):
+                    return
+                self._press_key_game_safe(key)
+        except Exception as ex:
+            self._log_error(f"IND_THREAD macro={session['name']} key={key}", ex)
+        finally:
+            self._session_thread_finished(macro_index, session)
 
-                    if self._stop_playback.is_set() or session_id != self._play_session_id:
-                        return
+    def _session_thread_finished(self, macro_index, session):
+        current = threading.current_thread()
+        other_alive = any(
+            thread is not current and thread.is_alive()
+            for thread in session["threads"]
+        )
 
-                    time.sleep(0.02)
+        with session["held_lock"]:
+            has_held = bool(session["held_inputs"])
 
-                break
+        if other_alive or (has_held and not session["stop"].is_set()):
+            return
 
-            if repeat_delay_s > 0:
-                end_t = time.time() + repeat_delay_s
-                while time.time() < end_t:
-                    if self._stop_playback.is_set() or session_id != self._play_session_id:
-                        return
-                    time.sleep(0.02)
+        session["stop"].set()
+        self._release_session_inputs(session)
+
+        with self._play_sessions_lock:
+            if self._play_sessions.get(macro_index) is session:
+                del self._play_sessions[macro_index]
 
         self.root.after(
             0,
-            lambda: self._set_status(
-                "SEQ finished (IND may still be running)." if self._any_ind_alive()
-                else "Playback finished."
-            )
+            lambda name=session["name"]: self._set_status(
+                f"{name} finished. {self._running_macro_count()} macro(s) running."
+            ),
         )
 
-    def _start_independent_workers(self, session_id: int):
-        self._independent_threads = []
-        ind_events = [ev for ev in self.events if ev.get("mode", "seq") == "ind"]
+    def stop_macro(self, macro_index: int):
+        with self._play_sessions_lock:
+            session = self._play_sessions.pop(macro_index, None)
 
-        for ev in ind_events:
-            key = ev["key"]
-            period_s = float(ev["delay"])
+        if session is None:
+            return
 
-            if period_s <= 0.0:
-                # 0ms IND means hold key until playback stops.
-                self._hold_key_game_safe(key)
-                continue
-
-            th = threading.Thread(
-                target=self._independent_worker_safe,
-                args=(key, period_s, session_id),
-                daemon=True
-            )
-            self._independent_threads.append(th)
-            th.start()
-
-    def _independent_worker_safe(self, key: str, period_s: float, session_id: int):
-        try:
-            self._independent_worker(key, period_s, session_id)
-        except Exception as ex:
-            self._log_error(f"IND_THREAD key={key}", ex)
-
-    def _independent_worker(self, key: str, period_s: float, session_id: int):
-        while not self._stop_playback.is_set() and session_id == self._play_session_id:
-            speed = max(0.01, float(self.playback_speed.get()))
-            sleep_s = max(0.001, period_s / speed)
-
-            end_t = time.time() + sleep_s
-            while time.time() < end_t:
-                if self._stop_playback.is_set() or session_id != self._play_session_id:
-                    return
-                time.sleep(0.01)
-
-            if self._stop_playback.is_set() or session_id != self._play_session_id:
-                return
-
-            self._press_key_game_safe(key)
-
-    def _any_ind_alive(self) -> bool:
-        return any(th.is_alive() for th in self._independent_threads)
-
-    def _schedule_watchdog(self, session_id: int):
-        def tick():
-            if session_id != self._play_session_id:
-                return
-            if self._stop_playback.is_set():
-                self._set_status("STANDBY")
-                return
-            if self._any_ind_alive() and (not (self._play_thread and self._play_thread.is_alive())):
-                self._set_status("Playing (IND still running)... (toggle key/button stops)")
-            self.root.after(500, tick)
-
-        self.root.after(500, tick)
+        session["stop"].set()
+        self._release_session_inputs(session)
+        self._pressed_toggle_macros.discard(macro_index)
+        self._set_status(
+            f"Stopped {session['name']}. "
+            f"{self._running_macro_count()} macro(s) running."
+        )
 
     def stop_playback(self):
-        self._held_toggle_macro_index = None
-        self._stop_playback.set()
-        self._play_session_id += 1
-        self._release_all_held_keys()
+        # Stop button / Esc remains an emergency stop for every running macro.
+        with self._play_sessions_lock:
+            sessions = list(self._play_sessions.items())
+            self._play_sessions.clear()
+
+        for macro_index, session in sessions:
+            session["stop"].set()
+            self._release_session_inputs(session)
+            self._pressed_toggle_macros.discard(macro_index)
+
         self._set_status("STANDBY")
 
     # ---------------- Hotkey capture ----------------
