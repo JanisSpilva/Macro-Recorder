@@ -84,6 +84,7 @@ class MacroApp:
         self.toggle_mouse_button = None
         self._toggle_pressed_guard = False
         self._mouse_listener = None
+        self._mouse_controller = pynput_mouse.Controller() if MOUSE_AVAILABLE else None
         self._resolve_toggle_key()
 
         self._build_ui()
@@ -201,7 +202,10 @@ class MacroApp:
                 self.toggle_scan_code = None
         elif val.startswith("mouse:"):
             btn = val.split(":", 1)[1].strip()
-            if btn in ("left", "right", "middle", "x1", "x2"):
+            # Security limitation: the primary left mouse button is never
+            # allowed as a playback toggle because ordinary UI clicks could
+            # unexpectedly start or stop the macro.
+            if btn in ("right", "middle", "x1", "x2"):
                 self.toggle_mouse_button = btn
         elif val:
             self.toggle_key_name = val
@@ -236,6 +240,49 @@ class MacroApp:
             return "x2"
 
         return None
+
+    @staticmethod
+    def _is_mouse_input(input_name: str) -> bool:
+        return str(input_name).lower().startswith("mouse:")
+
+    def _pynput_mouse_button(self, input_name: str):
+        if not MOUSE_AVAILABLE:
+            return None
+
+        name = str(input_name).lower().split(":", 1)[-1]
+        mapping = {
+            "left": pynput_mouse.Button.left,
+            "right": pynput_mouse.Button.right,
+            "middle": pynput_mouse.Button.middle,
+        }
+
+        if name == "x1":
+            return getattr(pynput_mouse.Button, "x1", None) or getattr(
+                pynput_mouse.Button, "button8", None
+            )
+        if name == "x2":
+            return getattr(pynput_mouse.Button, "x2", None) or getattr(
+                pynput_mouse.Button, "button9", None
+            )
+
+        return mapping.get(name)
+
+    def _record_input_step(self, input_name: str):
+        t = time.perf_counter()
+        delay_sec = t - (self._last_time if self._last_time is not None else t)
+        self._last_time = t
+
+        input_name = str(input_name).strip().lower()
+        self.events.append({"key": input_name, "delay": float(delay_sec), "mode": "seq"})
+        idx = len(self.events)
+        delay_ms = self.sec_to_ms_int(delay_sec)
+
+        self.root.after(
+            0,
+            lambda i=idx, k=input_name, ms=delay_ms: self.tree.insert(
+                "", "end", values=(f"{i:03d}", k, str(ms), "SEQ")
+            )
+        )
 
     # ---------------- UI ----------------
 
@@ -305,15 +352,19 @@ class MacroApp:
 
         ttk.Label(hotkeys, text="Play toggle").grid(row=1, column=0, sticky="w", pady=(8, 0))
         self.toggle_entry = ttk.Entry(
-            hotkeys, textvariable=self.play_toggle_key, width=16, justify="center"
+            hotkeys,
+            textvariable=self.play_toggle_key,
+            width=16,
+            justify="center",
+            state="readonly"
         )
         self.toggle_entry.grid(row=1, column=1, sticky="w", padx=(8, 6), pady=(8, 0))
-        ttk.Button(hotkeys, text="Apply", command=self.apply_toggle_hotkey).grid(
-            row=1, column=2, padx=(0, 6), pady=(8, 0)
-        )
-        ttk.Button(hotkeys, text="Press a key…", command=self.capture_toggle_hotkey).grid(
-            row=1, column=3, pady=(8, 0)
-        )
+
+        ttk.Button(
+            hotkeys,
+            text="Press a key…",
+            command=self.capture_toggle_hotkey
+        ).grid(row=1, column=2, pady=(8, 0))
 
         # Step editor with a dedicated editing toolbar.
         list_frame = ttk.LabelFrame(frm, text="Recorded steps", padding=8)
@@ -434,7 +485,7 @@ class MacroApp:
         except Exception:
             pass
 
-        self._set_status("Recording ON — press keys now (F9 to stop).")
+        self._set_status("Recording ON — press keyboard keys or mouse buttons (F9 to stop).")
 
     def stop_recording(self):
         self.recording = False
@@ -478,14 +529,7 @@ class MacroApp:
         if not key or key in self.ignore_keys:
             return
 
-        t = time.perf_counter()
-        delay_sec = t - (self._last_time if self._last_time is not None else t)
-        self._last_time = t
-
-        self.events.append({"key": key, "delay": float(delay_sec), "mode": "seq"})
-        idx = len(self.events)
-        delay_ms = self.sec_to_ms_int(delay_sec)
-        self.root.after(0, lambda: self.tree.insert("", "end", values=(f"{idx:03d}", key, f"{delay_ms}", "SEQ")))
+        self._record_input_step(key)
 
     def _start_mouse_listener(self):
         if not MOUSE_AVAILABLE:
@@ -504,18 +548,31 @@ class MacroApp:
             return
 
         if self._capturing_toggle_key and pressed:
+            if btn_name == "left":
+                self.root.after(
+                    0,
+                    lambda: self._set_status(
+                        "Left mouse button is not allowed as Play Toggle. "
+                        "Press another key or mouse button."
+                    )
+                )
+                return
+
             self.root.after(0, lambda: self._finish_capture_toggle_key(f"mouse:{btn_name}"))
             return
 
-        if not self.use_hotkeys.get():
-            return
-
-        if self.toggle_mouse_button == btn_name:
+        if self.use_hotkeys.get() and self.toggle_mouse_button == btn_name:
             if pressed and not self._toggle_pressed_guard:
                 self._toggle_pressed_guard = True
                 self.root.after(0, self.toggle_playback)
             elif not pressed:
                 self._toggle_pressed_guard = False
+            return
+
+        # Record every supported mouse button as a macro step.
+        # Left mouse remains blocked only as the Play Toggle.
+        if self.recording and pressed:
+            self._record_input_step(f"mouse:{btn_name}")
 
     # ---------------- Inline editing ----------------
 
@@ -812,6 +869,23 @@ class MacroApp:
 
     def _press_key_game_safe(self, key: str):
         HOLD_S = 0.02
+
+        if self._is_mouse_input(key):
+            button = self._pynput_mouse_button(key)
+            if self._mouse_controller is None or button is None:
+                self._log_error(
+                    f"MOUSE_CLICK input={key}",
+                    RuntimeError(f"Mouse button is unavailable: {key}")
+                )
+                return
+            try:
+                self._mouse_controller.press(button)
+                time.sleep(HOLD_S)
+                self._mouse_controller.release(button)
+            except Exception as ex:
+                self._log_error(f"MOUSE_CLICK input={key}", ex)
+            return
+
         try:
             input_driver.keyDown(key)
             time.sleep(HOLD_S)
@@ -819,8 +893,8 @@ class MacroApp:
         except Exception:
             try:
                 input_driver.press(key)
-            except Exception:
-                pass
+            except Exception as ex:
+                self._log_error(f"KEY_PRESS key={key}", ex)
 
     def _hold_key_game_safe(self, key: str):
         with self._held_keys_lock:
@@ -829,10 +903,17 @@ class MacroApp:
             self._held_keys.add(key)
 
         try:
-            input_driver.keyDown(key)
+            if self._is_mouse_input(key):
+                button = self._pynput_mouse_button(key)
+                if self._mouse_controller is None or button is None:
+                    raise RuntimeError(f"Mouse button is unavailable: {key}")
+                self._mouse_controller.press(button)
+            else:
+                input_driver.keyDown(key)
         except Exception as ex:
-            self._log_error(f"HOLD_KEY key={key}", ex)
-
+            with self._held_keys_lock:
+                self._held_keys.discard(key)
+            self._log_error(f"HOLD_INPUT input={key}", ex)
 
     def _release_key_game_safe(self, key: str):
         with self._held_keys_lock:
@@ -841,9 +922,15 @@ class MacroApp:
             self._held_keys.remove(key)
 
         try:
-            input_driver.keyUp(key)
+            if self._is_mouse_input(key):
+                button = self._pynput_mouse_button(key)
+                if self._mouse_controller is None or button is None:
+                    raise RuntimeError(f"Mouse button is unavailable: {key}")
+                self._mouse_controller.release(button)
+            else:
+                input_driver.keyUp(key)
         except Exception as ex:
-            self._log_error(f"RELEASE_KEY key={key}", ex)
+            self._log_error(f"RELEASE_INPUT input={key}", ex)
 
 
     def _release_all_held_keys(self):
@@ -853,9 +940,15 @@ class MacroApp:
 
         for key in keys:
             try:
-                input_driver.keyUp(key)
+                if self._is_mouse_input(key):
+                    button = self._pynput_mouse_button(key)
+                    if self._mouse_controller is None or button is None:
+                        raise RuntimeError(f"Mouse button is unavailable: {key}")
+                    self._mouse_controller.release(button)
+                else:
+                    input_driver.keyUp(key)
             except Exception as ex:
-                self._log_error(f"RELEASE_ALL key={key}", ex)
+                self._log_error(f"RELEASE_ALL input={key}", ex)
 
     def _play_worker_sequential_safe(self, session_id: int):
         try:
@@ -1002,8 +1095,20 @@ class MacroApp:
         self._set_status("Press a keyboard key or mouse button for Play Toggle...")
 
     def _finish_capture_toggle_key(self, key_id: str):
+        key_id = str(key_id).strip().lower()
+
+        if key_id == "mouse:left":
+            self._capturing_toggle_key = True
+            messagebox.showwarning(
+                "Unsafe toggle blocked",
+                "The left mouse button cannot be assigned as the Play Toggle.\n\n"
+                "Choose a keyboard key, right/middle mouse button, or X1/X2."
+            )
+            self._set_status("Left mouse is blocked. Press another toggle input.")
+            return
+
         self._capturing_toggle_key = False
-        self.play_toggle_key.set(str(key_id).strip().lower())
+        self.play_toggle_key.set(key_id)
         self._resolve_toggle_key()
         self._set_status(f"Play toggle hotkey set to: {self.play_toggle_key.get()}")
 
@@ -1085,6 +1190,13 @@ class MacroApp:
                 pass
 
             tkey = str(data.get("play_toggle_key", "f8")).strip().lower()
+            if tkey == "mouse:left":
+                tkey = "f8"
+                messagebox.showwarning(
+                    "Unsafe toggle removed",
+                    "This macro file used the left mouse button as Play Toggle.\n\n"
+                    "For safety, it has been reset to F8."
+                )
             if tkey:
                 self.play_toggle_key.set(tkey)
             self._resolve_toggle_key()
@@ -1103,25 +1215,7 @@ class MacroApp:
         except Exception as ex:
             messagebox.showerror("Load failed", str(ex))
 
-    # ---------------- Hotkeys (F9/F10/ESC only) ----------------
-
-    def apply_toggle_hotkey(self):
-        key = str(self.play_toggle_key.get()).strip().lower()
-        if not key:
-            messagebox.showerror("Invalid", "Toggle hotkey cannot be empty.")
-            return
-
-        if key.startswith("mouse:") and not MOUSE_AVAILABLE:
-            messagebox.showerror("Not available", "Mouse toggle requires 'pynput'.")
-            return
-
-        if not key.startswith("mouse:") and not KEYBOARD_AVAILABLE:
-            messagebox.showerror("Not available", "Keyboard hotkeys require the 'keyboard' module.")
-            return
-
-        self.play_toggle_key.set(key)
-        self._resolve_toggle_key()
-        self._set_status(f"Applied play toggle hotkey: {key}")
+    # ---------------- Hotkeys ----------------
 
     def _setup_hotkeys(self):
         try:
