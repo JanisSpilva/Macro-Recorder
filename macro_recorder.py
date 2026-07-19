@@ -2,7 +2,7 @@ import json
 import time
 import threading
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
 import traceback
 import os
 import sys
@@ -52,7 +52,21 @@ class MacroApp:
         self._apply_dark_theme()
 
         self.recording = False
-        self.events = []  # {"key": str, "delay": float(seconds), "mode": "seq"|"ind"}
+
+        # Unlimited macro library. self.events always points to the active macro's list.
+        self.macros = [
+            {
+                "name": "Macro 1",
+                "events": [],
+                "toggle": "f8",
+                "repeat_enabled": False,
+                "hold_to_repeat": False,
+                "repeat_delay_ms": 0,
+                "speed": 1.0,
+            }
+        ]
+        self.active_macro_index = 0
+        self.events = self.macros[0]["events"]
         self._last_time = None
 
         self._play_thread = None
@@ -72,10 +86,14 @@ class MacroApp:
         self.use_hotkeys = tk.BooleanVar(value=True)
         self.playback_speed = tk.DoubleVar(value=1.0)
 
-        self.play_toggle_key = tk.StringVar(value="f8")
+        self.play_toggle_key = tk.StringVar(value=self.macros[0]["toggle"])
 
         self.repeat_enabled = tk.BooleanVar(value=False)
+        self.hold_to_repeat = tk.BooleanVar(value=False)
         self.repeat_delay_ms = tk.IntVar(value=0)
+
+        # Index of the macro currently being held for hold-to-repeat playback.
+        self._held_toggle_macro_index = None
 
         self._capturing_toggle_key = False
 
@@ -85,9 +103,13 @@ class MacroApp:
         self._toggle_pressed_guard = False
         self._mouse_listener = None
         self._mouse_controller = pynput_mouse.Controller() if MOUSE_AVAILABLE else None
+
+        # Prevent the Record/Stop button's own left-click from becoming a macro step.
+        self._ignore_next_left_click = False
         self._resolve_toggle_key()
 
         self._build_ui()
+        self._load_active_macro()
 
         if KEYBOARD_AVAILABLE:
             keyboard.hook(self._on_key_event)
@@ -284,6 +306,293 @@ class MacroApp:
             )
         )
 
+    def _active_macro(self):
+        return self.macros[self.active_macro_index]
+
+    def _store_active_macro(self):
+        macro = self._active_macro()
+        macro["events"] = self.events
+        macro["toggle"] = str(self.play_toggle_key.get()).strip().lower() or "none"
+        macro["repeat_enabled"] = bool(self.repeat_enabled.get())
+        macro["hold_to_repeat"] = bool(self.hold_to_repeat.get())
+
+        try:
+            macro["repeat_delay_ms"] = max(0, int(self.repeat_delay_ms.get()))
+        except Exception:
+            macro["repeat_delay_ms"] = 0
+
+        try:
+            macro["speed"] = max(0.25, min(3.0, float(self.playback_speed.get())))
+        except Exception:
+            macro["speed"] = 1.0
+
+    def _load_active_macro(self):
+        macro = self._active_macro()
+        self.events = macro["events"]
+        self.play_toggle_key.set(macro.get("toggle", "none"))
+        self.repeat_enabled.set(bool(macro.get("repeat_enabled", False)))
+        self.hold_to_repeat.set(bool(macro.get("hold_to_repeat", False)))
+        self.repeat_delay_ms.set(max(0, int(macro.get("repeat_delay_ms", 0))))
+        self.playback_speed.set(float(macro.get("speed", 1.0)))
+
+        if hasattr(self, "speed_val"):
+            self.speed_val.config(text=f"{float(self.playback_speed.get()):.2f}×")
+
+        self._resolve_toggle_key()
+        self._refresh_tree()
+
+    def _refresh_tree(self):
+        if not hasattr(self, "tree"):
+            return
+
+        for iid in self.tree.get_children():
+            self.tree.delete(iid)
+
+        for i, ev in enumerate(self.events, start=1):
+            self.tree.insert(
+                "",
+                "end",
+                values=(
+                    f"{i:03d}",
+                    ev["key"],
+                    str(self.sec_to_ms_int(ev["delay"])),
+                    self._mode_label(ev.get("mode", "seq")),
+                ),
+            )
+
+        self._set_status(
+            f"Editing {self._active_macro()['name']} — {len(self.events)} step(s)."
+        )
+
+    def _refresh_macro_selector(self):
+        names = [macro["name"] for macro in self.macros]
+        self.macro_selector["values"] = names
+        self.macro_selector.current(self.active_macro_index)
+
+    def _next_macro_name(self):
+        used = {macro["name"] for macro in self.macros}
+        number = 1
+        while f"Macro {number}" in used:
+            number += 1
+        return f"Macro {number}"
+
+    def add_macro(self):
+        if self.recording or self._is_playing():
+            messagebox.showwarning("Busy", "Stop recording or playback before adding a macro.")
+            return
+
+        self._store_active_macro()
+        new_name = self._next_macro_name()
+
+        self.macros.append(
+            {
+                "name": new_name,
+                "events": [],
+                "toggle": "none",
+                "repeat_enabled": False,
+                "hold_to_repeat": False,
+                "repeat_delay_ms": 0,
+                "speed": 1.0,
+            }
+        )
+
+        self.active_macro_index = len(self.macros) - 1
+        self._refresh_macro_selector()
+        self._load_active_macro()
+        self.rename_active_macro()
+
+    def rename_active_macro(self):
+        if self.recording or self._is_playing():
+            messagebox.showwarning("Busy", "Stop recording or playback before renaming a macro.")
+            return
+
+        current = self._active_macro()["name"]
+        new_name = simpledialog.askstring(
+            "Rename macro",
+            "Macro name:",
+            initialvalue=current,
+            parent=self.root,
+        )
+        if new_name is None:
+            return
+
+        new_name = new_name.strip()
+        if not new_name:
+            messagebox.showerror("Invalid name", "Macro name cannot be empty.")
+            return
+
+        if any(
+            i != self.active_macro_index and macro["name"].lower() == new_name.lower()
+            for i, macro in enumerate(self.macros)
+        ):
+            messagebox.showerror("Duplicate name", "Another macro already uses that name.")
+            return
+
+        self._active_macro()["name"] = new_name
+        self._refresh_macro_selector()
+        self._set_status(f"Renamed macro to {new_name}.")
+
+    def delete_active_macro(self):
+        if len(self.macros) <= 1:
+            messagebox.showinfo("Required", "At least one macro must remain.")
+            return
+
+        if self.recording or self._is_playing():
+            messagebox.showwarning("Busy", "Stop recording or playback before deleting a macro.")
+            return
+
+        name = self._active_macro()["name"]
+        if not messagebox.askyesno("Delete macro", f'Delete "{name}"?'):
+            return
+
+        del self.macros[self.active_macro_index]
+        self.active_macro_index = min(self.active_macro_index, len(self.macros) - 1)
+        self._refresh_macro_selector()
+        self._load_active_macro()
+
+    def duplicate_active_macro(self):
+        if self.recording or self._is_playing():
+            messagebox.showwarning("Busy", "Stop recording or playback before duplicating a macro.")
+            return
+
+        self._store_active_macro()
+        source = self._active_macro()
+        base = f"{source['name']} Copy"
+        name = base
+        suffix = 2
+        used = {macro["name"].lower() for macro in self.macros}
+
+        while name.lower() in used:
+            name = f"{base} {suffix}"
+            suffix += 1
+
+        duplicate = {
+            "name": name,
+            "events": [dict(ev) for ev in source["events"]],
+            "toggle": "none",
+            "repeat_enabled": bool(source.get("repeat_enabled", False)),
+            "hold_to_repeat": bool(source.get("hold_to_repeat", False)),
+            "repeat_delay_ms": int(source.get("repeat_delay_ms", 0)),
+            "speed": float(source.get("speed", 1.0)),
+        }
+
+        self.macros.append(duplicate)
+        self.active_macro_index = len(self.macros) - 1
+        self._refresh_macro_selector()
+        self._load_active_macro()
+
+    def switch_macro(self, _event=None):
+        if self.recording or self._is_playing():
+            self.macro_selector.current(self.active_macro_index)
+            messagebox.showwarning("Busy", "Stop recording or playback before switching macros.")
+            return
+
+        new_index = self.macro_selector.current()
+        if new_index < 0 or new_index == self.active_macro_index:
+            return
+
+        self._store_active_macro()
+        self.active_macro_index = new_index
+        self._load_active_macro()
+
+    @staticmethod
+    def _parse_toggle(toggle_value: str):
+        value = str(toggle_value).strip().lower()
+
+        if value.startswith("scan:"):
+            try:
+                return "scan", int(value.split(":", 1)[1])
+            except Exception:
+                return "none", None
+
+        if value.startswith("mouse:"):
+            return "mouse", value.split(":", 1)[1].strip()
+
+        if value and value != "none":
+            return "key", value
+
+        return "none", None
+
+    def _find_macro_for_keyboard_event(self, event):
+        event_name = (event.name or "").lower()
+        event_scan = getattr(event, "scan_code", None)
+
+        for index, macro in enumerate(self.macros):
+            kind, value = self._parse_toggle(macro.get("toggle", "none"))
+
+            if kind == "scan" and event_scan == value:
+                return index
+
+            if kind == "key" and event_name == value:
+                return index
+
+        return None
+
+    def _find_macro_for_mouse_button(self, button_name: str):
+        wanted = f"mouse:{button_name}"
+
+        if wanted == "mouse:left":
+            return None
+
+        for index, macro in enumerate(self.macros):
+            if macro.get("toggle", "none") == wanted:
+                return index
+
+        return None
+
+    def _macro_uses_hold_to_repeat(self, macro_index: int) -> bool:
+        return (
+            0 <= macro_index < len(self.macros)
+            and bool(self.macros[macro_index].get("hold_to_repeat", False))
+        )
+
+    def start_held_macro(self, macro_index: int):
+        if not (0 <= macro_index < len(self.macros)):
+            return
+        if self.recording:
+            return
+
+        # Ignore key-repeat/autorepeat down events while the same toggle is held.
+        if self._held_toggle_macro_index == macro_index:
+            return
+
+        if self._is_playing():
+            self.stop_playback()
+
+        if macro_index != self.active_macro_index:
+            self._store_active_macro()
+            self.active_macro_index = macro_index
+            self._refresh_macro_selector()
+            self._load_active_macro()
+
+        self._held_toggle_macro_index = macro_index
+        self.play_macro()
+
+    def stop_held_macro(self, macro_index: int):
+        if self._held_toggle_macro_index != macro_index:
+            return
+        self._held_toggle_macro_index = None
+        self.stop_playback()
+
+    def toggle_macro_by_index(self, macro_index: int):
+        if not (0 <= macro_index < len(self.macros)):
+            return
+
+        if self._is_playing():
+            self.stop_playback()
+            return
+
+        if self.recording:
+            return
+
+        if macro_index != self.active_macro_index:
+            self._store_active_macro()
+            self.active_macro_index = macro_index
+            self._refresh_macro_selector()
+            self._load_active_macro()
+
+        self.play_macro()
+
     # ---------------- UI ----------------
 
     def _build_ui(self):
@@ -292,13 +601,17 @@ class MacroApp:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
         frm.columnconfigure(0, weight=1)
-        frm.rowconfigure(3, weight=1)
+        frm.rowconfigure(4, weight=1)
 
         # Main actions: the controls used most often are kept together.
         actions = ttk.LabelFrame(frm, text="Macro controls", padding=8)
         actions.grid(row=0, column=0, sticky="ew")
 
-        self.btn_record = ttk.Button(actions, text="● Record", command=self.toggle_recording)
+        self.btn_record = ttk.Button(
+            actions,
+            text="● Record",
+            command=self._record_button_clicked
+        )
         self.btn_record.grid(row=0, column=0, padx=(0, 6))
 
         self.btn_play = ttk.Button(actions, text="▶ Play", command=self.play_macro)
@@ -313,9 +626,35 @@ class MacroApp:
         ttk.Button(actions, text="Save", command=self.save_macro).grid(row=0, column=5, padx=(0, 6))
         ttk.Button(actions, text="Clear", command=self.clear_macro).grid(row=0, column=6)
 
-        # Playback settings are grouped separately so the toolbar stays easy to scan.
+        library = ttk.LabelFrame(frm, text="Macro library", padding=8)
+        library.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        library.columnconfigure(0, weight=1)
+
+        self.macro_selector = ttk.Combobox(
+            library,
+            state="readonly",
+            values=[macro["name"] for macro in self.macros],
+        )
+        self.macro_selector.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self.macro_selector.current(self.active_macro_index)
+        self.macro_selector.bind("<<ComboboxSelected>>", self.switch_macro)
+
+        ttk.Button(library, text="+ New", command=self.add_macro).grid(
+            row=0, column=1, padx=(0, 6)
+        )
+        ttk.Button(library, text="Rename", command=self.rename_active_macro).grid(
+            row=0, column=2, padx=(0, 6)
+        )
+        ttk.Button(library, text="Duplicate", command=self.duplicate_active_macro).grid(
+            row=0, column=3, padx=(0, 6)
+        )
+        ttk.Button(library, text="Delete", command=self.delete_active_macro).grid(
+            row=0, column=4
+        )
+
+        # Playback settings are stored separately for every macro.
         settings = ttk.LabelFrame(frm, text="Playback settings", padding=8)
-        settings.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        settings.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         settings.columnconfigure(1, weight=1)
 
         ttk.Label(settings, text="Speed").grid(row=0, column=0, sticky="w")
@@ -333,13 +672,20 @@ class MacroApp:
         )
         self.chk_repeat.grid(row=1, column=0, sticky="w", pady=(8, 0))
 
-        ttk.Label(settings, text="Repeat delay").grid(row=1, column=1, sticky="e", pady=(8, 0))
+        self.chk_hold_repeat = ttk.Checkbutton(
+            settings,
+            text="Repeat while holding toggle",
+            variable=self.hold_to_repeat
+        )
+        self.chk_hold_repeat.grid(row=2, column=0, sticky="w", pady=(8, 0))
+
+        ttk.Label(settings, text="Repeat delay").grid(row=2, column=1, sticky="e", pady=(8, 0))
         self.repeat_delay_entry = ttk.Entry(settings, textvariable=self.repeat_delay_ms, width=8, justify="center")
-        self.repeat_delay_entry.grid(row=1, column=2, sticky="w", padx=(8, 0), pady=(8, 0))
-        ttk.Label(settings, text="ms").grid(row=1, column=3, sticky="w", padx=(4, 0), pady=(8, 0))
+        self.repeat_delay_entry.grid(row=2, column=2, sticky="w", padx=(8, 0), pady=(8, 0))
+        ttk.Label(settings, text="ms").grid(row=2, column=3, sticky="w", padx=(4, 0), pady=(8, 0))
 
         hotkeys = ttk.LabelFrame(frm, text="Hotkeys", padding=8)
-        hotkeys.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        hotkeys.grid(row=3, column=0, sticky="ew", pady=(8, 0))
         hotkeys.columnconfigure(1, weight=1)
 
         self.chk_hotkeys = ttk.Checkbutton(
@@ -368,7 +714,7 @@ class MacroApp:
 
         # Step editor with a dedicated editing toolbar.
         list_frame = ttk.LabelFrame(frm, text="Recorded steps", padding=8)
-        list_frame.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
+        list_frame.grid(row=4, column=0, sticky="nsew", pady=(8, 0))
         list_frame.rowconfigure(1, weight=1)
         list_frame.columnconfigure(0, weight=1)
 
@@ -424,7 +770,7 @@ class MacroApp:
         self.step_menu.add_command(label="Delete", command=self.delete_selected_step)
 
         footer = ttk.Frame(frm)
-        footer.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        footer.grid(row=6, column=0, sticky="ew", pady=(8, 0))
         footer.columnconfigure(0, weight=1)
 
         self.status = ttk.Label(footer, text="Ready.", anchor="w")
@@ -451,6 +797,34 @@ class MacroApp:
             self.step_count.config(text=f"{count} step" if count == 1 else f"{count} steps")
 
     # ---------------- Recording ----------------
+
+    def _record_button_clicked(self):
+        # Tkinter runs this command after the mouse press has already happened,
+        # but the global mouse hook may still be processing the same click.
+        # Mark one left-click for removal/suppression when stopping by mouse.
+        was_recording = self.recording
+
+        if was_recording:
+            self._ignore_next_left_click = True
+
+            # In case the global listener already recorded this exact UI click,
+            # remove a trailing left-mouse step immediately.
+            if self.events and self.events[-1].get("key") == "mouse:left":
+                self.events.pop()
+                children = list(self.tree.get_children(""))
+                if children:
+                    self.tree.delete(children[-1])
+                self._renumber_steps()
+
+        self.toggle_recording()
+
+        # The listener normally receives the press before this callback. Clear the
+        # fallback flag shortly afterward so the next real click is not ignored.
+        if was_recording:
+            self.root.after(150, self._clear_ignored_left_click)
+
+    def _clear_ignored_left_click(self):
+        self._ignore_next_left_click = False
 
     def toggle_recording(self):
         if not KEYBOARD_AVAILABLE:
@@ -499,6 +873,7 @@ class MacroApp:
     def _on_key_event(self, e):
         if self._capturing_toggle_key and e.event_type == "down":
             sc = getattr(e, "scan_code", None)
+
             if sc is not None:
                 self.root.after(0, lambda: self._finish_capture_toggle_key(f"scan:{sc}"))
             else:
@@ -508,16 +883,28 @@ class MacroApp:
             return
 
         if self.use_hotkeys.get():
-            is_toggle = False
-            if self.toggle_scan_code is not None and getattr(e, "scan_code", None) == self.toggle_scan_code:
-                is_toggle = True
-            elif self.toggle_scan_code is None and self.toggle_key_name and (e.name or "").lower() == self.toggle_key_name:
-                is_toggle = True
+            macro_index = self._find_macro_for_keyboard_event(e)
 
-            if is_toggle:
+            if macro_index is not None:
+                if self._macro_uses_hold_to_repeat(macro_index):
+                    if e.event_type == "down":
+                        self.root.after(
+                            0,
+                            lambda index=macro_index: self.start_held_macro(index),
+                        )
+                    elif e.event_type == "up":
+                        self.root.after(
+                            0,
+                            lambda index=macro_index: self.stop_held_macro(index),
+                        )
+                    return
+
                 if e.event_type == "down" and not self._toggle_pressed_guard:
                     self._toggle_pressed_guard = True
-                    self.root.after(0, self.toggle_playback)
+                    self.root.after(
+                        0,
+                        lambda index=macro_index: self.toggle_macro_by_index(index),
+                    )
                 elif e.event_type == "up":
                     self._toggle_pressed_guard = False
                 return
@@ -561,12 +948,39 @@ class MacroApp:
             self.root.after(0, lambda: self._finish_capture_toggle_key(f"mouse:{btn_name}"))
             return
 
-        if self.use_hotkeys.get() and self.toggle_mouse_button == btn_name:
+        macro_index = (
+            self._find_macro_for_mouse_button(btn_name)
+            if self.use_hotkeys.get()
+            else None
+        )
+
+        if macro_index is not None:
+            if self._macro_uses_hold_to_repeat(macro_index):
+                if pressed:
+                    self.root.after(
+                        0,
+                        lambda index=macro_index: self.start_held_macro(index),
+                    )
+                else:
+                    self.root.after(
+                        0,
+                        lambda index=macro_index: self.stop_held_macro(index),
+                    )
+                return
+
             if pressed and not self._toggle_pressed_guard:
                 self._toggle_pressed_guard = True
-                self.root.after(0, self.toggle_playback)
+                self.root.after(
+                    0,
+                    lambda index=macro_index: self.toggle_macro_by_index(index),
+                )
             elif not pressed:
                 self._toggle_pressed_guard = False
+            return
+
+        # Ignore the Record/Stop button's own left-click.
+        if pressed and btn_name == "left" and self._ignore_next_left_click:
+            self._ignore_next_left_click = False
             return
 
         # Record every supported mouse button as a macro step.
@@ -830,6 +1244,7 @@ class MacroApp:
             self.play_macro()
 
     def play_macro(self):
+        self._store_active_macro()
         if self.recording:
             messagebox.showwarning("Recording", "Stop recording before playback.")
             return
@@ -864,7 +1279,10 @@ class MacroApp:
             )
             self._play_thread.start()
 
-        self._set_status("Playing... (toggle key/button stops)")
+        if self.hold_to_repeat.get():
+            self._set_status("Playing while toggle is held...")
+        else:
+            self._set_status("Playing... (toggle key/button stops)")
         self._schedule_watchdog(session_id)
 
     def _press_key_game_safe(self, key: str):
@@ -964,7 +1382,7 @@ class MacroApp:
 
     def _play_worker_sequential(self, session_id: int):
         speed = max(0.01, float(self.playback_speed.get()))
-        repeat = bool(self.repeat_enabled.get())
+        repeat = bool(self.repeat_enabled.get()) or bool(self.hold_to_repeat.get())
         repeat_delay_s = self.ms_int_to_sec(int(self.repeat_delay_ms.get() or 0))
 
         seq_events = [ev for ev in self.events if ev.get("mode", "seq") == "seq"]
@@ -1080,6 +1498,7 @@ class MacroApp:
         self.root.after(500, tick)
 
     def stop_playback(self):
+        self._held_toggle_macro_index = None
         self._stop_playback.set()
         self._play_session_id += 1
         self._release_all_held_keys()
@@ -1107,10 +1526,23 @@ class MacroApp:
             self._set_status("Left mouse is blocked. Press another toggle input.")
             return
 
+        for index, macro in enumerate(self.macros):
+            if index != self.active_macro_index and macro.get("toggle", "none") == key_id:
+                self._capturing_toggle_key = True
+                messagebox.showwarning(
+                    "Toggle already used",
+                    f"{key_id} is already assigned to {macro['name']}.",
+                )
+                self._set_status("Choose a different toggle input.")
+                return
+
         self._capturing_toggle_key = False
         self.play_toggle_key.set(key_id)
+        self._active_macro()["toggle"] = key_id
         self._resolve_toggle_key()
-        self._set_status(f"Play toggle hotkey set to: {self.play_toggle_key.get()}")
+        self._set_status(
+            f"{self._active_macro()['name']} toggle set to: {key_id}"
+        )
 
     # ---------------- Save/Load/Clear ----------------
 
@@ -1122,10 +1554,10 @@ class MacroApp:
         self.events.clear()
         for iid in self.tree.get_children():
             self.tree.delete(iid)
-        self._set_status("Cleared.")
+        self._set_status(f"Cleared {self._active_macro()['name']}.")
 
     def save_macro(self):
-        if not self.events:
+        if not self.macros:
             messagebox.showinfo("Empty", "Nothing to save.")
             return
         self._end_inline_edit(commit=True)
@@ -1138,12 +1570,11 @@ class MacroApp:
         if not path:
             return
 
+        self._store_active_macro()
         data = {
-            "version": 4,
-            "events": self.events,
-            "repeat_enabled": bool(self.repeat_enabled.get()),
-            "repeat_delay_ms": int(self.repeat_delay_ms.get()),
-            "play_toggle_key": str(self.play_toggle_key.get()).strip().lower() or "f8",
+            "version": 7,
+            "active_macro_index": self.active_macro_index,
+            "macros": self.macros,
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
@@ -1166,52 +1597,147 @@ class MacroApp:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
-            events = data.get("events", [])
-            if not isinstance(events, list):
-                raise ValueError("Invalid file format")
+            loaded_macros = data.get("macros")
 
-            cleaned = []
-            for ev in events:
-                if not isinstance(ev, dict):
-                    continue
-                k = str(ev.get("key", "")).lower()
-                d = float(ev.get("delay", 0.0))
-                mode = str(ev.get("mode", "seq")).lower()
-                if mode not in ("seq", "ind"):
-                    mode = "seq"
-                if k:
-                    cleaned.append({"key": k, "delay": max(0.0, d), "mode": mode})
-            self.events = cleaned
+            if isinstance(loaded_macros, list) and loaded_macros:
+                cleaned_macros = []
 
-            self.repeat_enabled.set(bool(data.get("repeat_enabled", False)))
-            try:
-                self.repeat_delay_ms.set(max(0, int(data.get("repeat_delay_ms", 0))))
-            except Exception:
-                pass
+                for number, macro in enumerate(loaded_macros, start=1):
+                    if not isinstance(macro, dict):
+                        continue
 
-            tkey = str(data.get("play_toggle_key", "f8")).strip().lower()
-            if tkey == "mouse:left":
-                tkey = "f8"
-                messagebox.showwarning(
-                    "Unsafe toggle removed",
-                    "This macro file used the left mouse button as Play Toggle.\n\n"
-                    "For safety, it has been reset to F8."
+                    cleaned_events = []
+
+                    for ev in macro.get("events", []):
+                        if not isinstance(ev, dict):
+                            continue
+
+                        key = str(ev.get("key", "")).strip().lower()
+
+                        try:
+                            delay = max(0.0, float(ev.get("delay", 0.0)))
+                        except Exception:
+                            delay = 0.0
+
+                        mode = str(ev.get("mode", "seq")).lower()
+                        if mode not in ("seq", "ind"):
+                            mode = "seq"
+
+                        if key:
+                            cleaned_events.append(
+                                {"key": key, "delay": delay, "mode": mode}
+                            )
+
+                    toggle = str(macro.get("toggle", "none")).strip().lower()
+
+                    if toggle == "mouse:left":
+                        toggle = "none"
+
+                    try:
+                        repeat_delay = max(
+                            0,
+                            int(macro.get("repeat_delay_ms", 0)),
+                        )
+                    except Exception:
+                        repeat_delay = 0
+
+                    try:
+                        speed = max(
+                            0.25,
+                            min(3.0, float(macro.get("speed", 1.0))),
+                        )
+                    except Exception:
+                        speed = 1.0
+
+                    cleaned_macros.append(
+                        {
+                            "name": str(
+                                macro.get("name", f"Macro {number}")
+                            ).strip()
+                            or f"Macro {number}",
+                            "events": cleaned_events,
+                            "toggle": toggle or "none",
+                            "repeat_enabled": bool(
+                                macro.get("repeat_enabled", False)
+                            ),
+                            "hold_to_repeat": bool(
+                                macro.get("hold_to_repeat", False)
+                            ),
+                            "repeat_delay_ms": repeat_delay,
+                            "speed": speed,
+                        }
+                    )
+
+                if not cleaned_macros:
+                    raise ValueError("No valid macros found in this file.")
+
+                self.macros = cleaned_macros
+
+                try:
+                    requested_index = int(data.get("active_macro_index", 0))
+                except Exception:
+                    requested_index = 0
+
+                self.active_macro_index = min(
+                    max(0, requested_index),
+                    len(self.macros) - 1,
                 )
-            if tkey:
-                self.play_toggle_key.set(tkey)
-            self._resolve_toggle_key()
+            else:
+                # Backward compatibility with version 4 single-macro files.
+                cleaned_events = []
 
-            for iid in self.tree.get_children():
-                self.tree.delete(iid)
+                for ev in data.get("events", []):
+                    if not isinstance(ev, dict):
+                        continue
 
-            for i, ev in enumerate(self.events, start=1):
-                ms = self.sec_to_ms_int(ev["delay"])
-                self.tree.insert("", "end", values=(f"{i:03d}", ev["key"], str(ms), self._mode_label(ev["mode"])))
+                    key = str(ev.get("key", "")).strip().lower()
+
+                    try:
+                        delay = max(0.0, float(ev.get("delay", 0.0)))
+                    except Exception:
+                        delay = 0.0
+
+                    mode = str(ev.get("mode", "seq")).lower()
+                    if mode not in ("seq", "ind"):
+                        mode = "seq"
+
+                    if key:
+                        cleaned_events.append(
+                            {"key": key, "delay": delay, "mode": mode}
+                        )
+
+                toggle = str(
+                    data.get("play_toggle_key", "f8")
+                ).strip().lower()
+
+                if toggle == "mouse:left":
+                    toggle = "f8"
+
+                self.macros = [
+                    {
+                        "name": "Macro 1",
+                        "events": cleaned_events,
+                        "toggle": toggle or "f8",
+                        "repeat_enabled": bool(
+                            data.get("repeat_enabled", False)
+                        ),
+                        "hold_to_repeat": False,
+                        "repeat_delay_ms": max(
+                            0,
+                            int(data.get("repeat_delay_ms", 0)),
+                        ),
+                        "speed": 1.0,
+                    }
+                ]
+                self.active_macro_index = 0
+
+            self._refresh_macro_selector()
+            self._load_active_macro()
 
             if KEYBOARD_AVAILABLE:
                 self._setup_hotkeys()
 
-            self._set_status(f"Loaded {len(self.events)} steps from {path}")
+            self._set_status(f"Loaded {len(self.macros)} macro(s) from {path}")
         except Exception as ex:
             messagebox.showerror("Load failed", str(ex))
 
@@ -1235,6 +1761,7 @@ class MacroApp:
         self._set_status("Hotkeys enabled." if self.use_hotkeys.get() else "Hotkeys disabled.")
 
     def on_close(self):
+        self._store_active_macro()
         try:
             self.stop_playback()
         except Exception:
