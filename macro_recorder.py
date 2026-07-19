@@ -4,6 +4,17 @@ import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import traceback
+import os
+import sys
+
+
+def resource_path(relative_path):
+    """Return an absolute path for development and PyInstaller builds."""
+    try:
+        base_path = sys._MEIPASS
+    except AttributeError:
+        base_path = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_path, relative_path)
 
 # --- Input driver (pydirectinput preferred for games) ---
 try:
@@ -35,7 +46,7 @@ except Exception:
 class MacroApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Simple Macro Recorder (pydirectinput playback)")
+        self.root.title("Simple Macro Recorder")
 
         # Apply dark theme BEFORE building UI widgets
         self._apply_dark_theme()
@@ -55,6 +66,7 @@ class MacroApp:
 
         self._edit_entry = None
         self._edit_iid = None
+        self._edit_field = None  # "key" or "delay_ms"
 
         self.ignore_keys = {"f9", "f10", "esc"}
         self.use_hotkeys = tk.BooleanVar(value=True)
@@ -63,7 +75,7 @@ class MacroApp:
         self.play_toggle_key = tk.StringVar(value="f8")
 
         self.repeat_enabled = tk.BooleanVar(value=False)
-        self.repeat_delay_ms = tk.IntVar(value=250)
+        self.repeat_delay_ms = tk.IntVar(value=0)
 
         self._capturing_toggle_key = False
 
@@ -228,98 +240,164 @@ class MacroApp:
     # ---------------- UI ----------------
 
     def _build_ui(self):
-        frm = ttk.Frame(self.root, padding=12)
+        frm = ttk.Frame(self.root, padding=10)
         frm.grid(row=0, column=0, sticky="nsew")
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
+        frm.columnconfigure(0, weight=1)
+        frm.rowconfigure(3, weight=1)
 
-        btns = ttk.Frame(frm)
-        btns.grid(row=0, column=0, sticky="ew")
+        # Main actions: the controls used most often are kept together.
+        actions = ttk.LabelFrame(frm, text="Macro controls", padding=8)
+        actions.grid(row=0, column=0, sticky="ew")
 
-        self.btn_record = ttk.Button(btns, text="Start Recording", command=self.toggle_recording)
-        self.btn_record.grid(row=0, column=0, padx=(0, 8))
+        self.btn_record = ttk.Button(actions, text="● Record", command=self.toggle_recording)
+        self.btn_record.grid(row=0, column=0, padx=(0, 6))
 
-        ttk.Button(btns, text="Play", command=self.play_macro).grid(row=0, column=1, padx=(0, 8))
-        ttk.Button(btns, text="Stop", command=self.stop_playback).grid(row=0, column=2, padx=(0, 8))
-        ttk.Button(btns, text="Clear", command=self.clear_macro).grid(row=0, column=3, padx=(0, 8))
-        ttk.Button(btns, text="Save", command=self.save_macro).grid(row=0, column=4, padx=(0, 8))
-        ttk.Button(btns, text="Load", command=self.load_macro).grid(row=0, column=5, padx=(0, 8))
+        self.btn_play = ttk.Button(actions, text="▶ Play", command=self.play_macro)
+        self.btn_play.grid(row=0, column=1, padx=(0, 6))
 
-        opts = ttk.Frame(frm)
-        opts.grid(row=1, column=0, sticky="ew", pady=(10, 0))
-        opts.columnconfigure(9, weight=1)
+        self.btn_stop = ttk.Button(actions, text="■ Stop", command=self.stop_playback)
+        self.btn_stop.grid(row=0, column=2, padx=(0, 14))
+
+        ttk.Separator(actions, orient="vertical").grid(row=0, column=3, sticky="ns", padx=(0, 14))
+
+        ttk.Button(actions, text="Load", command=self.load_macro).grid(row=0, column=4, padx=(0, 6))
+        ttk.Button(actions, text="Save", command=self.save_macro).grid(row=0, column=5, padx=(0, 6))
+        ttk.Button(actions, text="Clear", command=self.clear_macro).grid(row=0, column=6)
+
+        # Playback settings are grouped separately so the toolbar stays easy to scan.
+        settings = ttk.LabelFrame(frm, text="Playback settings", padding=8)
+        settings.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        settings.columnconfigure(1, weight=1)
+
+        ttk.Label(settings, text="Speed").grid(row=0, column=0, sticky="w")
+        self.speed = ttk.Scale(
+            settings, from_=0.25, to=3.0,
+            variable=self.playback_speed, orient="horizontal"
+        )
+        self.speed.grid(row=0, column=1, sticky="ew", padx=(8, 6))
+        self.speed_val = ttk.Label(settings, text="1.00×", width=6, anchor="center")
+        self.speed_val.grid(row=0, column=2, sticky="w")
+        self.speed.configure(command=lambda value: self.speed_val.config(text=f"{float(value):.2f}×"))
+
+        self.chk_repeat = ttk.Checkbutton(
+            settings, text="Repeat sequence", variable=self.repeat_enabled
+        )
+        self.chk_repeat.grid(row=1, column=0, sticky="w", pady=(8, 0))
+
+        ttk.Label(settings, text="Repeat delay").grid(row=1, column=1, sticky="e", pady=(8, 0))
+        self.repeat_delay_entry = ttk.Entry(settings, textvariable=self.repeat_delay_ms, width=8, justify="center")
+        self.repeat_delay_entry.grid(row=1, column=2, sticky="w", padx=(8, 0), pady=(8, 0))
+        ttk.Label(settings, text="ms").grid(row=1, column=3, sticky="w", padx=(4, 0), pady=(8, 0))
+
+        hotkeys = ttk.LabelFrame(frm, text="Hotkeys", padding=8)
+        hotkeys.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        hotkeys.columnconfigure(1, weight=1)
 
         self.chk_hotkeys = ttk.Checkbutton(
-            opts,
-            text="Enable hotkeys (F9 record, F10 play, ESC stop playback; toggle supports keyboard or mouse)",
+            hotkeys,
+            text="Enable F9 record, F10 play and Esc stop",
             variable=self.use_hotkeys,
             command=self._hotkeys_toggled
         )
-        self.chk_hotkeys.grid(row=0, column=0, sticky="w", columnspan=10)
+        self.chk_hotkeys.grid(row=0, column=0, columnspan=4, sticky="w")
 
-        ttk.Label(opts, text="Playback speed:").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        self.speed = ttk.Scale(opts, from_=0.25, to=3.0, variable=self.playback_speed, orient="horizontal")
-        self.speed.grid(row=1, column=1, sticky="ew", pady=(8, 0), padx=(8, 8), columnspan=2)
-        self.speed_val = ttk.Label(opts, text="1.00x")
-        self.speed_val.grid(row=1, column=3, sticky="w", pady=(8, 0))
-        self.speed.bind("<Motion>", lambda _e: self.speed_val.config(text=f"{self.playback_speed.get():.2f}x"))
-        self.speed.bind("<ButtonRelease-1>", lambda _e: self.speed_val.config(text=f"{self.playback_speed.get():.2f}x"))
+        ttk.Label(hotkeys, text="Play toggle").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.toggle_entry = ttk.Entry(
+            hotkeys, textvariable=self.play_toggle_key, width=16, justify="center"
+        )
+        self.toggle_entry.grid(row=1, column=1, sticky="w", padx=(8, 6), pady=(8, 0))
+        ttk.Button(hotkeys, text="Apply", command=self.apply_toggle_hotkey).grid(
+            row=1, column=2, padx=(0, 6), pady=(8, 0)
+        )
+        ttk.Button(hotkeys, text="Press a key…", command=self.capture_toggle_hotkey).grid(
+            row=1, column=3, pady=(8, 0)
+        )
 
-        ttk.Label(opts, text="Play toggle key/button:").grid(row=2, column=0, sticky="w", pady=(8, 0))
-        self.toggle_entry = ttk.Entry(opts, textvariable=self.play_toggle_key, width=18)
-        self.toggle_entry.grid(row=2, column=1, padx=(8, 8), sticky="w", pady=(8, 0))
-        ttk.Button(opts, text="Apply", command=self.apply_toggle_hotkey).grid(row=2, column=2, padx=(0, 8), pady=(8, 0))
-        ttk.Button(opts, text="Set (press key)", command=self.capture_toggle_hotkey).grid(row=2, column=3, padx=(0, 12), pady=(8, 0))
-
-        self.chk_repeat = ttk.Checkbutton(opts, text="Repeat SEQ part", variable=self.repeat_enabled)
-        self.chk_repeat.grid(row=2, column=4, sticky="w", pady=(8, 0))
-        ttk.Label(opts, text="Repeat delay (ms):").grid(row=2, column=5, padx=(8, 0), sticky="w", pady=(8, 0))
-        self.repeat_delay_entry = ttk.Entry(opts, textvariable=self.repeat_delay_ms, width=8)
-        self.repeat_delay_entry.grid(row=2, column=6, padx=(8, 0), sticky="w", pady=(8, 0))
-
-        list_frame = ttk.LabelFrame(frm, text="Steps (Delay ms: dblclick edit; Mode: dblclick toggle SEQ/IND)")
-        list_frame.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
-        frm.rowconfigure(3, weight=1)
-
-        columns = ("step", "key", "delay_ms", "mode")
-        self.tree = ttk.Treeview(list_frame, columns=columns, show="headings", selectmode="browse")
-        self.tree.heading("step", text="#")
-        self.tree.heading("key", text="Key")
-        self.tree.heading("delay_ms", text="Delay (ms)")
-        self.tree.heading("mode", text="Mode")
-
-        self.tree.column("step", width=60, anchor="e", stretch=False)
-        self.tree.column("key", width=180, anchor="w", stretch=True)
-        self.tree.column("delay_ms", width=120, anchor="e", stretch=False)
-        self.tree.column("mode", width=80, anchor="center", stretch=False)
-
-        self.tree.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
-        list_frame.rowconfigure(0, weight=1)
+        # Step editor with a dedicated editing toolbar.
+        list_frame = ttk.LabelFrame(frm, text="Recorded steps", padding=8)
+        list_frame.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
+        list_frame.rowconfigure(1, weight=1)
         list_frame.columnconfigure(0, weight=1)
 
+        editbar = ttk.Frame(list_frame)
+        editbar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+
+        ttk.Button(editbar, text="Edit key", command=self.edit_selected_key).grid(row=0, column=0, padx=(0, 5))
+        ttk.Button(editbar, text="Edit delay", command=self.edit_selected_delay).grid(row=0, column=1, padx=(0, 5))
+        ttk.Button(editbar, text="SEQ / IND", command=self.toggle_selected_mode).grid(row=0, column=2, padx=(0, 12))
+        ttk.Button(editbar, text="↑", width=3, command=lambda: self.move_selected_step(-1)).grid(row=0, column=3, padx=(0, 4))
+        ttk.Button(editbar, text="↓", width=3, command=lambda: self.move_selected_step(1)).grid(row=0, column=4, padx=(0, 4))
+        ttk.Button(editbar, text="Duplicate", command=self.duplicate_selected_step).grid(row=0, column=5, padx=(0, 5))
+        ttk.Button(editbar, text="Delete", command=self.delete_selected_step).grid(row=0, column=6)
+
+        columns = ("step", "key", "delay_ms", "mode")
+        self.tree = ttk.Treeview(
+            list_frame, columns=columns, show="headings",
+            selectmode="browse", height=12
+        )
+        self.tree.heading("step", text="#")
+        self.tree.heading("key", text="Key")
+        self.tree.heading("delay_ms", text="Delay")
+        self.tree.heading("mode", text="Mode")
+
+        self.tree.column("step", width=45, minwidth=45, anchor="center", stretch=False)
+        self.tree.column("key", width=120, minwidth=90, anchor="center", stretch=True)
+        self.tree.column("delay_ms", width=85, minwidth=75, anchor="center", stretch=False)
+        self.tree.column("mode", width=60, minwidth=55, anchor="center", stretch=False)
+
+        self.tree.grid(row=1, column=0, sticky="nsew")
         scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.tree.yview)
-        scrollbar.grid(row=0, column=1, sticky="ns", pady=8)
+        scrollbar.grid(row=1, column=1, sticky="ns")
         self.tree.configure(yscrollcommand=scrollbar.set)
 
         self.tree.bind("<Double-1>", self._on_tree_double_click)
         self.tree.bind("<Button-1>", self._on_tree_single_click)
+        self.tree.bind("<Button-3>", self._show_step_menu)
+        self.tree.bind("<Delete>", lambda _e: self.delete_selected_step())
+        self.tree.bind("<BackSpace>", lambda _e: self.delete_selected_step())
+        self.tree.bind("<Control-d>", lambda _e: self.duplicate_selected_step())
+        self.tree.bind("<Alt-Up>", lambda _e: self.move_selected_step(-1))
+        self.tree.bind("<Alt-Down>", lambda _e: self.move_selected_step(1))
 
-        self.status = ttk.Label(frm, text="Ready.", anchor="w")
-        self.status.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+        self.step_menu = tk.Menu(self.root, tearoff=False)
+        self.step_menu.add_command(label="Edit key", command=self.edit_selected_key)
+        self.step_menu.add_command(label="Edit delay", command=self.edit_selected_delay)
+        self.step_menu.add_command(label="Toggle SEQ / IND", command=self.toggle_selected_mode)
+        self.step_menu.add_separator()
+        self.step_menu.add_command(label="Move up", command=lambda: self.move_selected_step(-1))
+        self.step_menu.add_command(label="Move down", command=lambda: self.move_selected_step(1))
+        self.step_menu.add_command(label="Duplicate", command=self.duplicate_selected_step)
+        self.step_menu.add_separator()
+        self.step_menu.add_command(label="Delete", command=self.delete_selected_step)
 
-        hint = "SEQ = plays in order. IND = repeats on its own timer. Toggle supports keys or mouse:left/right/middle. Errors are logged to macro_errors.log"
-        ttk.Label(frm, text=hint, foreground="#bdbdbd", anchor="w", justify="left").grid(
-            row=5, column=0, sticky="ew", pady=(8, 0)
+        footer = ttk.Frame(frm)
+        footer.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        footer.columnconfigure(0, weight=1)
+
+        self.status = ttk.Label(footer, text="Ready.", anchor="w")
+        self.status.grid(row=0, column=0, sticky="ew")
+
+        self.step_count = ttk.Label(footer, text="0 steps", anchor="e")
+        self.step_count.grid(row=0, column=1, padx=(12, 0))
+
+        hint = "Double-click a cell to edit • Delete removes • Ctrl+D duplicates • Alt+↑/↓ reorders"
+        ttk.Label(frm, text=hint, foreground="#bdbdbd", anchor="center").grid(
+            row=5, column=0, sticky="ew", pady=(5, 0)
         )
 
         if not KEYBOARD_AVAILABLE:
             self.chk_hotkeys.state(["disabled"])
-            self._set_status("keyboard module not installed/usable. Install 'keyboard' to record keystrokes globally.")
+            self._set_status("keyboard module unavailable. Install 'keyboard' for global recording.")
         if not PYDIRECT_AVAILABLE:
-            self._set_status("NOTE: pydirectinput not installed; using pyautogui fallback (may fail in games).")
+            self._set_status("Using pyautogui fallback; pydirectinput is recommended for games.")
 
     def _set_status(self, msg: str):
         self.status.config(text=msg)
+        if hasattr(self, "step_count"):
+            count = len(self.events)
+            self.step_count.config(text=f"{count} step" if count == 1 else f"{count} steps")
 
     # ---------------- Recording ----------------
 
@@ -345,14 +423,24 @@ class MacroApp:
         self.recording = True
         self._last_time = time.perf_counter()
 
-        self.btn_record.config(text="Stop Recording")
+        self.btn_record.config(text="■ Stop recording")
+
+        # Important: after clicking Start Recording, the button keeps keyboard focus.
+        # In Tkinter, pressing Space activates the focused button, which would click
+        # the same button again and stop recording. Move focus away so Space can be
+        # recorded normally instead of cancelling recording.
+        try:
+            self.root.focus_set()
+        except Exception:
+            pass
+
         self._set_status("Recording ON — press keys now (F9 to stop).")
 
     def stop_recording(self):
         self.recording = False
         self._last_time = None
 
-        self.btn_record.config(text="Start Recording")
+        self.btn_record.config(text="● Record")
         self._set_status(f"Recording OFF — captured {len(self.events)} steps.")
 
     # ---------------- Keyboard / Mouse hooks ----------------
@@ -434,12 +522,10 @@ class MacroApp:
     def _on_tree_single_click(self, event):
         if self._edit_entry is not None:
             region = self.tree.identify("region", event.x, event.y)
-            if region != "cell":
+            col = self.tree.identify_column(event.x) if region == "cell" else ""
+            active_col = "#2" if self._edit_field == "key" else "#3"
+            if region != "cell" or col != active_col:
                 self._end_inline_edit(commit=True)
-            else:
-                col = self.tree.identify_column(event.x)
-                if col != "#3":
-                    self._end_inline_edit(commit=True)
 
     def _on_tree_double_click(self, event):
         if self.recording:
@@ -448,60 +534,213 @@ class MacroApp:
         col = self.tree.identify_column(event.x)
         if not row_iid:
             return
-        if col == "#3":
+        if col == "#2":
+            self._begin_edit_key_cell(row_iid)
+        elif col == "#3":
             self._begin_edit_delay_cell(row_iid)
         elif col == "#4":
             self._toggle_mode_cell(row_iid)
 
-    def _begin_edit_delay_cell(self, iid: str):
+    def _begin_inline_edit(self, iid: str, field: str):
         self._end_inline_edit(commit=True)
-        bbox = self.tree.bbox(iid, column="delay_ms")
+        bbox = self.tree.bbox(iid, column=field)
         if not bbox:
             return
+
         x, y, w, h = bbox
-        current_ms_text = self.tree.set(iid, "delay_ms")
+        current_text = self.tree.set(iid, field)
 
         self._edit_iid = iid
+        self._edit_field = field
         self._edit_entry = ttk.Entry(self.tree)
         self._edit_entry.place(x=x, y=y, width=w, height=h)
-        self._edit_entry.insert(0, current_ms_text)
+        self._edit_entry.insert(0, current_text)
         self._edit_entry.select_range(0, tk.END)
-        self._edit_entry.focus()
+        self._edit_entry.focus_set()
 
         self._edit_entry.bind("<Return>", lambda _e: self._end_inline_edit(commit=True))
         self._edit_entry.bind("<Escape>", lambda _e: self._end_inline_edit(commit=False))
         self._edit_entry.bind("<FocusOut>", lambda _e: self._end_inline_edit(commit=True))
 
+    def _begin_edit_key_cell(self, iid: str):
+        self._begin_inline_edit(iid, "key")
+
+    def _begin_edit_delay_cell(self, iid: str):
+        self._begin_inline_edit(iid, "delay_ms")
+
     def _end_inline_edit(self, commit: bool):
         if self._edit_entry is None or self._edit_iid is None:
             return
+
         iid = self._edit_iid
+        field = self._edit_field
         entry = self._edit_entry
-        new_text = entry.get().strip()
+        new_text = entry.get().strip().lower()
 
         self._edit_entry = None
         self._edit_iid = None
+        self._edit_field = None
         entry.destroy()
 
         if not commit:
             return
 
-        try:
-            new_ms = int(new_text)
-            if new_ms < 0:
-                raise ValueError
-        except Exception:
-            messagebox.showerror("Invalid delay", "Enter a non-negative integer milliseconds, e.g. 55 or 5000.")
-            return
-
-        self.tree.set(iid, "delay_ms", str(new_ms))
         children = list(self.tree.get_children(""))
         try:
             idx = children.index(iid)
         except ValueError:
             return
-        if 0 <= idx < len(self.events):
+        if not (0 <= idx < len(self.events)):
+            return
+
+        if field == "key":
+            if not new_text:
+                messagebox.showerror("Invalid key", "Key cannot be empty. Delete the step if it is not needed.")
+                return
+            self.tree.set(iid, "key", new_text)
+            self.events[idx]["key"] = new_text
+            self._set_status(f"Step {idx + 1} key changed to: {new_text}")
+            return
+
+        if field == "delay_ms":
+            try:
+                new_ms = int(new_text)
+                if new_ms < 0:
+                    raise ValueError
+            except Exception:
+                messagebox.showerror("Invalid delay", "Enter a non-negative integer milliseconds, e.g. 55 or 5000.")
+                return
+
+            self.tree.set(iid, "delay_ms", str(new_ms))
             self.events[idx]["delay"] = self.ms_int_to_sec(new_ms)
+            self._set_status(f"Step {idx + 1} delay changed to {new_ms} ms.")
+
+    def _renumber_steps(self):
+        for i, iid in enumerate(self.tree.get_children(""), start=1):
+            self.tree.set(iid, "step", f"{i:03d}")
+
+    def delete_selected_step(self):
+        if self.recording:
+            messagebox.showwarning("Recording", "Stop recording before deleting steps.")
+            return
+        if self._is_playing():
+            messagebox.showwarning("Playing", "Stop playback before deleting steps.")
+            return
+
+        self._end_inline_edit(commit=True)
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showinfo("No selection", "Select a step to delete.")
+            return
+
+        iid = selected[0]
+        children = list(self.tree.get_children(""))
+        try:
+            idx = children.index(iid)
+        except ValueError:
+            return
+
+        self.tree.delete(iid)
+        if 0 <= idx < len(self.events):
+            del self.events[idx]
+
+        self._renumber_steps()
+
+        remaining = list(self.tree.get_children(""))
+        if remaining:
+            next_idx = min(idx, len(remaining) - 1)
+            self.tree.selection_set(remaining[next_idx])
+            self.tree.focus(remaining[next_idx])
+
+        self._set_status(f"Deleted step {idx + 1}. {len(self.events)} step(s) remain.")
+
+    def _selected_iid(self):
+        selected = self.tree.selection()
+        return selected[0] if selected else None
+
+    def edit_selected_key(self):
+        iid = self._selected_iid()
+        if iid:
+            self._begin_edit_key_cell(iid)
+        else:
+            self._set_status("Select a step first.")
+
+    def edit_selected_delay(self):
+        iid = self._selected_iid()
+        if iid:
+            self._begin_edit_delay_cell(iid)
+        else:
+            self._set_status("Select a step first.")
+
+    def toggle_selected_mode(self):
+        iid = self._selected_iid()
+        if iid:
+            self._toggle_mode_cell(iid)
+            self._set_status("Step mode changed.")
+        else:
+            self._set_status("Select a step first.")
+
+    def _show_step_menu(self, event):
+        iid = self.tree.identify_row(event.y)
+        if iid:
+            self.tree.selection_set(iid)
+            self.tree.focus(iid)
+            try:
+                self.step_menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                self.step_menu.grab_release()
+
+    def duplicate_selected_step(self):
+        if self.recording or self._is_playing():
+            messagebox.showwarning("Busy", "Stop recording or playback before editing steps.")
+            return
+
+        self._end_inline_edit(commit=True)
+        iid = self._selected_iid()
+        if not iid:
+            self._set_status("Select a step to duplicate.")
+            return
+
+        children = list(self.tree.get_children(""))
+        idx = children.index(iid)
+        duplicate = dict(self.events[idx])
+        self.events.insert(idx + 1, duplicate)
+
+        new_iid = self.tree.insert(
+            "", idx + 1,
+            values=("", duplicate["key"], str(self.sec_to_ms_int(duplicate["delay"])),
+                    self._mode_label(duplicate.get("mode", "seq")))
+        )
+        self._renumber_steps()
+        self.tree.selection_set(new_iid)
+        self.tree.focus(new_iid)
+        self.tree.see(new_iid)
+        self._set_status(f"Duplicated step {idx + 1}.")
+
+    def move_selected_step(self, direction: int):
+        if self.recording or self._is_playing():
+            messagebox.showwarning("Busy", "Stop recording or playback before reordering steps.")
+            return
+
+        self._end_inline_edit(commit=True)
+        iid = self._selected_iid()
+        if not iid:
+            self._set_status("Select a step to move.")
+            return
+
+        children = list(self.tree.get_children(""))
+        old_idx = children.index(iid)
+        new_idx = old_idx + direction
+        if new_idx < 0 or new_idx >= len(children):
+            return
+
+        self.events[old_idx], self.events[new_idx] = self.events[new_idx], self.events[old_idx]
+        self.tree.move(iid, "", new_idx)
+        self._renumber_steps()
+        self.tree.selection_set(iid)
+        self.tree.focus(iid)
+        self.tree.see(iid)
+        self._set_status(f"Moved step to position {new_idx + 1}.")
 
     def _toggle_mode_cell(self, iid: str):
         children = list(self.tree.get_children(""))
@@ -841,7 +1080,7 @@ class MacroApp:
 
             self.repeat_enabled.set(bool(data.get("repeat_enabled", False)))
             try:
-                self.repeat_delay_ms.set(max(0, int(data.get("repeat_delay_ms", 250))))
+                self.repeat_delay_ms.set(max(0, int(data.get("repeat_delay_ms", 0))))
             except Exception:
                 pass
 
@@ -919,13 +1158,23 @@ class MacroApp:
             pass
         self.root.destroy()
 
-
 def main():
     root = tk.Tk()
-    MacroApp(root)
-    root.geometry("980x580")
-    root.mainloop()
 
+    # Set window icon
+    try:
+        icon = tk.PhotoImage(file=resource_path("macro.png"))
+        root.iconphoto(True, icon)
+        root._icon = icon      # keep a reference so it isn't garbage collected
+    except Exception as e:
+        print("Couldn't load icon:", e)
+
+    MacroApp(root)
+
+    root.update_idletasks()
+    root.geometry("")
+    root.minsize(root.winfo_reqwidth(), root.winfo_reqheight())
+    root.mainloop()
 
 if __name__ == "__main__":
     main()
